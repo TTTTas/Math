@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from typing import List, Tuple, Optional
 
 from matplotlib import pyplot as plt
+from shapely import STRtree
 from shapely.geometry import Point, Polygon, LineString
 import numpy as np
 from shapely.geometry import Point, Polygon
@@ -118,6 +119,113 @@ def construct_sector_feature_vector(
 
                 if blocked:
                     break  # 射线被阻挡，停止延伸
+
+    return feature_vector
+
+def construct_sector_feature_vector_fast(
+        landscape,
+        observation_point: tuple,
+        n_sectors: int = 8,
+        rays_per_sector: int = 5,
+        max_distance: float = 50.0,
+        decay_func: Callable[[float], float] = None,
+) -> Dict[str, np.ndarray]:
+    """
+    构造观赏点的空间分布特征向量（优化版，射线相交 + 空间索引 + 通视率）
+    """
+    if decay_func is None:
+        decay_func = lambda d: max(0, 1 - d / max_distance)
+
+    feature_vector = {etype: np.zeros(n_sectors) for etype in ['building', 'rock', 'plant', 'water']}
+    ox, oy = observation_point
+
+    # 1. 构造 shapely 几何对象并建索引
+    geom_list = []
+    elem_map = []
+    for e in landscape.elements:
+        geom = None
+        if e.geometry.type == "Polygon":
+            coords = e.geometry.coordinates
+            if isinstance(coords, dict):  # 带 holes
+                geom = Polygon(coords["shell"], coords.get("holes", []))
+            else:
+                geom = Polygon(coords)
+        elif e.geometry.type == "Circle":
+            geom = Point(e.geometry.center).buffer(e.geometry.radius, resolution=32)
+        if geom is not None:
+            geom_list.append(geom)
+            elem_map.append(e)
+
+    tree = STRtree(geom_list)
+
+    # 2. 遍历扇区与射线
+    sector_angles = np.linspace(0, 2 * np.pi, n_sectors + 1)
+
+    for sector_idx in range(n_sectors):
+        start_angle = sector_angles[sector_idx]
+        end_angle = sector_angles[sector_idx + 1]
+        rays = np.linspace(start_angle, end_angle, rays_per_sector, endpoint=False)
+
+        for angle in rays:
+            dx, dy = np.cos(angle), np.sin(angle)
+            ray = LineString([
+                (ox, oy),
+                (ox + dx * max_distance, oy + dy * max_distance)
+            ])
+
+            # 查询可能相交的元素
+            candidates = tree.query(ray)
+
+            # 收集交点
+            hit_elements = []
+            # === 0. 检查空置域，处理起点在元素内部的情况 ===
+            for geom, elem in zip(geom_list, elem_map):
+                if geom.contains(Point(ox, oy)):
+                    # 起点在元素内部，加入虚拟交点
+                    hit_elements.append((0.3, elem))  # 距离 0 或者 r_safe
+
+            # === 1. 计算正常交点 ===
+            for geom, elem in zip(geom_list, elem_map):
+                if not ray.intersects(geom):
+                    continue
+                inter = ray.intersection(geom)
+                if inter.is_empty:
+                    continue
+
+                pts = []
+                if inter.geom_type == "Point":
+                    pts = [(inter.x, inter.y)]
+                elif inter.geom_type == "MultiPoint":
+                    pts = [(p.x, p.y) for p in inter.geoms]
+                elif inter.geom_type == "LineString":
+                    pts = list(inter.coords)
+                elif inter.geom_type == "MultiLineString":
+                    pts = [c for g in inter.geoms for c in g.coords]
+                elif inter.geom_type == "GeometryCollection":
+                    for g in inter.geoms:
+                        if g.geom_type == "Point":
+                            pts.append((g.x, g.y))
+                        elif g.geom_type == "LineString":
+                            pts.extend(list(g.coords))
+
+                for (px, py) in pts:
+                    dist = np.hypot(px - ox, py - oy)
+                    if dist > 1e-6:  # 排除起点
+                        hit_elements.append((dist, elem))
+
+            # === 2. 按距离排序并累积通视率 ===
+            hit_elements.sort(key=lambda x: x[0])
+
+            # 引入通视率
+            ray_transparency = 1.0
+            for dist, elem in hit_elements:
+                weight = decay_func(dist) * elem.weight * ray_transparency
+                feature_vector[elem.type][sector_idx] += weight
+
+                # 更新射线通视度
+                ray_transparency *= elem.transparent
+                if ray_transparency < 1e-5:
+                    break  # 视线几乎完全被遮挡，提前停止
 
     return feature_vector
 

@@ -3,6 +3,8 @@ from collections import defaultdict
 
 import os
 
+import pandas as pd
+
 mm2m_convr = 1000.0;
 
 # 映射表
@@ -179,3 +181,37 @@ def dxf_path_to_graph(dxf_file, target_layer="path", tol=1e-6):
 
     return nodes, edges
 
+
+def load_graph_from_excel(file_path, offset=(0, 0)):
+    df = pd.read_excel(file_path, sheet_name=0, header=None)
+
+    nodes = {}
+    edges = []
+    edge_lengths = {}
+
+    # 解析节点部分（前两列）
+    for idx, row in df.iterrows():
+        if pd.isna(row[0]) or pd.isna(row[1]):
+            continue
+        node_id = int(row[0])
+        x_str, y_str = str(row[1]).split(",")
+        x, y = float(x_str) + offset[0], float(y_str) + offset[1]
+        nodes[node_id] = (x, y)
+
+    # 解析边部分（第三、四列及可选第五列）
+    for idx, row in df.iterrows():
+        if pd.isna(row[2]) or pd.isna(row[3]):
+            continue
+        start_str, end_str = str(row[2]).split(",")
+        start, end = int(start_str), int(end_str)
+        edges.append((start, end))
+
+        if len(row) > 4 and not pd.isna(row[4]):
+            length = float(row[4])
+        else:
+            x1, y1 = nodes[start]
+            x2, y2 = nodes[end]
+            length = ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
+        edge_lengths[(start, end)] = length
+
+    return nodes, edges, edge_lengths

@@ -58,6 +58,7 @@ def parse_and_classify_dxf(msp):
                  "layer": layer,
                  "visibility": False}
             circles.append(c)
+            # print(e.dxf.center.x)
             all_entities.append(c)
 
         # 边界点
@@ -183,11 +184,18 @@ def dxf_path_to_graph(dxf_file, target_layer="path", tol=1e-6):
 
 
 def load_graph_from_excel(file_path, offset=(0, 0)):
+    """
+    从 Excel 加载图结构
+    - 第1、2列：节点ID，节点坐标 x,y
+    - 第3、4列：边起点、终点
+    - 第5列：边经过的点坐标列表，格式 "x1,y1;x2,y2;..."
+    """
     df = pd.read_excel(file_path, sheet_name=0, header=None)
 
     nodes = {}
     edges = []
     edge_lengths = {}
+    edge_paths = {}  # 新增：边经过的路径点
 
     # 解析节点部分（前两列）
     for idx, row in df.iterrows():
@@ -198,7 +206,7 @@ def load_graph_from_excel(file_path, offset=(0, 0)):
         x, y = float(x_str) + offset[0], float(y_str) + offset[1]
         nodes[node_id] = (x, y)
 
-    # 解析边部分（第三、四列及可选第五列）
+    # 解析边部分（第三、四列及第五列）
     for idx, row in df.iterrows():
         if pd.isna(row[2]) or pd.isna(row[3]):
             continue
@@ -206,12 +214,20 @@ def load_graph_from_excel(file_path, offset=(0, 0)):
         start, end = int(start_str), int(end_str)
         edges.append((start, end))
 
+        # 边长度
         if len(row) > 4 and not pd.isna(row[4]):
-            length = float(row[4])
-        else:
-            x1, y1 = nodes[start]
-            x2, y2 = nodes[end]
-            length = ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
+            # 解析边经过的坐标列表
+            coord_strs = str(row[4]).split(";")
+            path_points = []
+            for s in coord_strs:
+                xs, ys = map(float, s.split(","))
+                xs += offset[0]
+                ys += offset[1]
+                path_points.append((xs, ys))
+            edge_paths[(start, end)] = path_points
+
+        length = float(row[3])
+
         edge_lengths[(start, end)] = length
 
-    return nodes, edges, edge_lengths
+    return nodes, edges, edge_lengths, edge_paths

@@ -1,3 +1,5 @@
+import math
+from matplotlib import cm
 import networkx as nx
 import numpy as np
 import matplotlib.pyplot as plt
@@ -247,6 +249,7 @@ def generate_initial_path(adjacency, nodes_coords, edges, edge_scores, edge_leng
         neighbors = adjacency[current]
         if not neighbors:
             return None
+        
         scores = [edge_scores.get((current, n), edge_scores.get((n, current), 0.1)) for n in neighbors]
         total = sum(scores)
         probs = [s / total for s in scores]
@@ -256,15 +259,52 @@ def generate_initial_path(adjacency, nodes_coords, edges, edge_scores, edge_leng
             unvisited_probs = [probs[neighbors.index(n)] for n in unvisited]
             total_un = sum(unvisited_probs)
             unvisited_probs = [p / total_un for p in unvisited_probs]
+        
             return random.choices(unvisited, weights=unvisited_probs, k=1)[0]
         else:
             return random.choices(neighbors, weights=probs, k=1)[0]
 
     if start != end:
-        sp = shortest_path(adjacency, start, end, edge_lengths)
-        if sp is None:
+        # 获取所有可达节点
+        reachable_nodes = []
+        for n in nodes_coords:
+            sp_start = shortest_path(adjacency, start, n, edge_lengths)
+            sp_end = shortest_path(adjacency, n, end, edge_lengths)
+            if sp_start and sp_end:
+                dist_start = sum(edge_lengths[tuple(sorted((u, v)))] for u, v in zip(sp_start[:-1], sp_start[1:]))
+                dist_end = sum(edge_lengths[tuple(sorted((u, v)))] for u, v in zip(sp_end[:-1], sp_end[1:]))
+                total_dist = dist_start + dist_end
+                reachable_nodes.append((n, total_dist))
+
+        if not reachable_nodes:
             raise ValueError(f"No path between start={start} and end={end}")
-        return sp
+
+        # 最大总距离
+        max_total_dist = max(d for _, d in reachable_nodes)
+
+        # 取距离大于最长路径的60%的节点作为候选
+        candidate_nodes = [(n, d) for n, d in reachable_nodes if d >= 0.6 * max_total_dist]
+
+        # 如果不足10个，从剩余节点中补足
+        if len(candidate_nodes) < 10:
+            remaining_nodes = [(n, d) for n, d in reachable_nodes if d < 0.6 * max_total_dist]
+            remaining_nodes.sort(key=lambda x: x[1], reverse=True)  # 按距离从大到小排序
+            needed = 10 - len(candidate_nodes)
+            candidate_nodes += remaining_nodes[:needed]
+        
+        num_candidates = len(candidate_nodes)
+        probs = [1 / num_candidates] * num_candidates
+        
+        # 随机选择一个中间节点
+        best_middle = random.choices([n for n, _ in candidate_nodes], weights=probs, k=1)[0]
+
+        # 合成路径 start -> best_middle -> end
+        path1 = shortest_path(adjacency, start, best_middle, edge_lengths)
+        path2 = shortest_path(adjacency, best_middle, end, edge_lengths)
+        full_path = path1 + path2[1:]  # 去掉重复的中间节点
+        return full_path
+
+
 
     # start == end 构造环
     coords_items = list(nodes_coords.items())
@@ -285,7 +325,7 @@ def generate_initial_path(adjacency, nodes_coords, edges, edge_scores, edge_leng
     # 生成候选路径 start->farthest，排除 start 重复
     paths = []
     attempts = 0
-    while len(paths) < k_paths and attempts < k_paths*5:
+    while len(paths) < k_paths and attempts < k_paths*20:
         attempts += 1
         path = [start]
         visited = {start}
@@ -300,17 +340,16 @@ def generate_initial_path(adjacency, nodes_coords, edges, edge_scores, edge_leng
         if current == farthest and path not in paths:
             paths.append(path)
 
-    if not paths:
-        sp = shortest_path(adjacency, start, farthest, edge_lengths)
-        if sp is None:
-            return [start]
-        return sp + list(reversed(sp))[1:]
+    # 必须至少有两条路径才能拼接
+    if len(paths) < 2:
+        raise ValueError(f"候选路径不足两条，无法生成闭环: len(paths)={len(paths)}")
 
-    # 选择两条交集最小的路径
+    # --- 两条交集最小路径 ---
     path_sets = [set(p) for p in paths]
     best_pair = (0, 1)
     best_score = None
     n = len(paths)
+
     for i in range(n):
         for j in range(i+1, n):
             s1, s2 = path_sets[i], path_sets[j]
@@ -321,7 +360,9 @@ def generate_initial_path(adjacency, nodes_coords, edges, edge_scores, edge_leng
                 best_score = score
                 best_pair = (i, j)
 
+    # 获取最优路径对
     p1, p2 = paths[best_pair[0]], paths[best_pair[1]]
+
     # 拼接形成环路，避免中间重复 start
     p2_rev = list(reversed(p2))
     merged = p1 + [n for n in p2_rev[1:] if n != start]
@@ -334,7 +375,7 @@ def generate_initial_path(adjacency, nodes_coords, edges, edge_scores, edge_leng
 def genetic_path_planning(nodes, edges, edge_scores, edge_lengths, start, end, feature_dict,
                           population_size=50, generations=200, mutation_prob=0.2,
                           alpha=0.6, beta=1.0, gamma=0.4, delta=0.02,
-                          max_path_length=None, cluster_eps=15.0):
+                          max_path_length=None, cluster_eps=10.0):
     """
     遗传算法路径规划，保证起终点，考虑边重复、点重复、区域重复、趣味性、覆盖率。
     """
@@ -358,51 +399,134 @@ def genetic_path_planning(nodes, edges, edge_scores, edge_lengths, start, end, f
     coords = np.array(list(nodes.values()))
     clustering = DBSCAN(eps=cluster_eps, min_samples=1).fit(coords)
     node_cluster = {node_id: label for node_id, label in zip(nodes.keys(), clustering.labels_)}
+    labels = np.array([node_cluster[nid] for nid in nodes.keys()])
+
+    # 获取簇的数量
+    n_clusters = len(set(labels))
+    colors = cm.get_cmap('tab20', n_clusters)  # 使用tab20调色板
+
+    plt.figure(figsize=(8, 8))
+    for idx, (x, y) in enumerate(coords):
+        cluster_id = labels[idx]
+        plt.scatter(x, y, color=colors(cluster_id), label=f'Cluster {cluster_id}' if idx == 0 else "", s=50)
+
+    # 可选：绘制节点编号
+    for nid, (x, y) in nodes.items():
+        plt.text(x, y, str(nid), fontsize=8, ha='right', va='bottom')
+
+    plt.title(f"DBSCAN Clustering (eps={cluster_eps})")
+    plt.xlabel("X")
+    plt.ylabel("Y")
+    plt.grid(True)
+    plt.axis('equal')
+    # plt.show()
 
     # --- 初始化种群 ---
     print("=== 初始化种群 ===")
     population = [generate_initial_path(adjacency, nodes, edges, edge_scores, edge_lengths, start, end)
                   for _ in tqdm(range(population_size), desc="初始化种群")]
-    for idx, path in enumerate(population):
-        print(f"个体 {idx+1}: {path}")
+    # for idx, path in enumerate(population):
+    #     print(f"个体 {idx+1}: {path}")
 
+    # --- 预计算区域趣味性 ---
+    cluster_fun_score = {}
+    for c in set(node_cluster.values()):
+        nodes_in_cluster = [n for n, cl in node_cluster.items() if cl == c]
+        scores = []
+        for i in range(len(nodes_in_cluster)):
+            for j in range(i+1, len(nodes_in_cluster)):
+                p = shortest_path(adjacency, nodes_in_cluster[i], nodes_in_cluster[j], edge_lengths)
+                if p:
+                    scores.append(compute_path_fun_score(p, edge_scores, edge_lengths, feature_dict))
+        if scores:
+            cluster_fun_score[c] = np.mean(scores)
+        else:
+            cluster_fun_score[c] = 0.0
+    
     # --- 适应度函数 ---
     def fitness(path):
         fun_score = compute_path_fun_score(path, edge_scores, edge_lengths, feature_dict)
 
-        # 边重复惩罚
+        # --- 边重复惩罚 ---
         counts_edge = {}
         edge_penalty = 0.0
         for k in range(len(path)-1):
             e = tuple(sorted((path[k], path[k+1])))
             counts_edge[e] = counts_edge.get(e,0) + 1
-            if counts_edge[e] == 2:
-                edge_penalty += 0.1
-            elif counts_edge[e] > 2:
-                edge_penalty += delta * (counts_edge[e]-2 + 1)
+            if counts_edge[e] > 1:
+                edge_penalty += delta * (counts_edge[e]-1)  # 改为每条重复边惩罚相同
 
-        # 点重复惩罚
+        # 归一化：平均到边数
+        edge_penalty /= max(len(path)-1, 1)
+
+        # --- 点重复惩罚 ---
         counts_node = {}
         node_penalty = 0.0
         for n in path:
             counts_node[n] = counts_node.get(n,0) + 1
-            if counts_node[n] > 2:
-                node_penalty += delta * (counts_node[n]-3 + 1)
+            if counts_node[n] > 1:
+                node_penalty += delta * (counts_node[n]-1)
 
-        # 区域重复惩罚
+        # 归一化：平均到节点数
+        node_penalty /= max(len(path), 1)
+
+        # --- 区域重复惩罚 ---
         cluster_counts = {}
         cluster_penalty = 0.0
         for n in path:
             c = node_cluster[n]
             cluster_counts[c] = cluster_counts.get(c,0)+1
-            if cluster_counts[c] > 3:
-                cluster_penalty += delta*(cluster_counts[c]-3)
-        # cluster_penalty /= len(path)
+            if cluster_counts[c] > 1:
+                cluster_penalty += delta * (cluster_counts[c]-1)
 
-        # 覆盖率
+        # 归一化：平均到涉及的簇数
+        cluster_penalty * max(len(set(node_cluster[n] for n in path)), 1)
+
+        # --- 区域未覆盖惩罚 ---
+        path_clusters = set(node_cluster[n] for n in path)
+        missing_clusters = set(cluster_fun_score.keys()) - path_clusters
+        missing_penalty = 0.0
+        if missing_clusters:
+            # 平均化：每个未覆盖簇贡献平均值
+            missing_penalty = sum(cluster_fun_score[c] for c in missing_clusters) / max(len(missing_clusters), 1)
+
+        # --- 覆盖率 ---
         coverage = len(set(path))/len(all_nodes_set)
 
-        return alpha*fun_score - beta*(edge_penalty + node_penalty + cluster_penalty) + gamma*coverage
+        # --- 大圈惩罚 ---
+        loop_penalty = 0.0
+        near_dist = 5
+        far_dist = 25.0
+        for i in range(len(path) - 2):
+            a, b, c = path[i], path[i+1], path[i+2]
+            xa, ya = nodes[a]
+            xb, yb = nodes[b]
+            xc, yc = nodes[c]
+
+            dist_ab = np.linalg.norm(np.array([xa, ya]) - np.array([xb, yb]))
+            dist_ac = np.linalg.norm(np.array([xa, ya]) - np.array([xc, yc]))
+
+            if dist_ac < near_dist and dist_ab > far_dist:
+                loop_penalty += delta * (dist_ab - far_dist + 1)
+
+        # 归一化：按路径长度
+        loop_penalty /= max(len(path)-2, 1)
+
+        # 最小节点数惩罚
+        min_node_ratio = 0.3  # 最少30%的节点
+        num_nodes = len(set(path))
+        min_nodes_required = int(min_node_ratio * len(all_nodes_set))
+        if num_nodes < min_nodes_required:
+            min_nodes_penalty = delta * (min_nodes_required - num_nodes)
+        else:
+            min_nodes_penalty = 0.0
+
+
+        scores = alpha*fun_score - beta*(edge_penalty + node_penalty + 0.4 * cluster_penalty + 2.5 * missing_penalty + 0.8 * loop_penalty + 0.4 * min_nodes_penalty) + gamma*coverage
+        if scores < 0:
+            return 1e-6
+        else:
+            return scores 
 
     # --- 选择 ---
     def select_pair(pop):
@@ -472,11 +596,14 @@ def genetic_path_planning(nodes, edges, edge_scores, edge_lengths, start, end, f
                 gen_best_path = p
 
         # 提前停止
-        if prev_best_score is not None and abs(gen_best_score-prev_best_score)<1e-8:
+        if prev_best_score is not None and abs(gen_best_score-prev_best_score)<1e-8 and abs(best_score) > 0.1:
             best_path, best_score = gen_best_path, gen_best_score
             break
         prev_best_score = gen_best_score
         if gen_best_score > best_score:
             best_path, best_score = gen_best_path, gen_best_score
+
+        if best_score < 1e-2:
+            raise("得分过小")
 
     return best_path, best_score

@@ -4,12 +4,14 @@ from typing import List, Tuple, Optional
 
 from matplotlib import pyplot as plt
 from shapely import STRtree
+import shapely
 from shapely.geometry import Point, Polygon, LineString
 import numpy as np
 from shapely.geometry import Point, Polygon
 from shapely.geometry.linestring import LineString
 from shapely.geometry import Point, Polygon
 from typing import Callable, Dict,Any
+from shapely.validation import explain_validity
 
 from Rs_type import LandscapeElement, LandscapeCollection
 
@@ -142,17 +144,33 @@ def construct_sector_feature_vector_fast(
     # 1. 构造 shapely 几何对象并建索引
     geom_list = []
     elem_map = []
-    for e in landscape.elements:
+    for idx, e in enumerate(landscape.elements):
         geom = None
+
         if e.geometry.type == "Polygon":
             coords = e.geometry.coordinates
             if isinstance(coords, dict):  # 带 holes
                 geom = Polygon(coords["shell"], coords.get("holes", []))
             else:
                 geom = Polygon(coords)
+
         elif e.geometry.type == "Circle":
             geom = Point(e.geometry.center).buffer(e.geometry.radius, resolution=32)
+
         if geom is not None:
+            # 检查几何体合法性
+            if not geom.is_valid:
+                reason = explain_validity(geom)
+                print(f"[Invalid Geometry] index={idx}, type={getattr(e,'type','unknown')}, reason={reason}")
+                # 如果需要，可把问题点标记出来
+                if "POINT" in reason:
+                    # 提取报错坐标
+                    import re
+                    coords = re.findall(r"[-+]?\d*\.\d+|\d+", reason)
+                    if coords and len(coords) >= 2:
+                        x, y = float(coords[0]), float(coords[1])
+                        print(f"--> 错误位置大概在 ({x}, {y})")
+                raise ValueError(f"Invalid geometry at element index {idx} ({getattr(e, 'type', 'unknown')})")
             geom_list.append(geom)
             elem_map.append(e)
 
@@ -180,9 +198,12 @@ def construct_sector_feature_vector_fast(
             hit_elements = []
             # === 0. 检查空置域，处理起点在元素内部的情况 ===
             for geom, elem in zip(geom_list, elem_map):
-                if geom.contains(Point(ox, oy)):
-                    # 起点在元素内部，加入虚拟交点
-                    hit_elements.append((0.3, elem))  # 距离 0 或者 r_safe
+                try:
+                    if geom.contains(Point(ox, oy)):
+                        # 起点在元素内部，加入虚拟交点
+                        hit_elements.append((0.3, elem))  # 距离 0 或者 r_safe
+                except shapely.errors.GEOSException as ex:
+                    raise ValueError(f"Topology error with element {e}: {ex}")
 
             # === 1. 计算正常交点 ===
             for geom, elem in zip(geom_list, elem_map):

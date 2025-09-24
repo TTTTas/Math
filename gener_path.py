@@ -1,8 +1,12 @@
+import networkx as nx
 import numpy as np
 import matplotlib.pyplot as plt
 import random
 from copy import deepcopy
-
+import heapq
+from collections import deque
+import random
+from typing import Dict, List, Tuple, Optional, Set
 from sklearn.cluster import DBSCAN
 from tqdm import tqdm
 
@@ -61,6 +65,10 @@ def compute_path_fun_score(path, edge_scores, edge_lengths, feature_dict, weight
     w1, w2, w3 = weights
     fun_score = w1 * edge_mean + w2 * edge_std + w3 * node_div
 
+    # --- 5. tanh 压缩映射到 [0,1] ---
+    fun_score = np.tanh(fun_score / 80)
+    fun_score = (fun_score + 1) / 2  # 映射到 [0,1]
+
     # --- 可选绘图 ---
     if plot:
         fig, axs = plt.subplots(2, 1, figsize=(10,6), sharex=True)
@@ -85,25 +93,264 @@ def compute_path_fun_score(path, edge_scores, edge_lengths, feature_dict, weight
     return fun_score
 
 
-def genetic_path_planning(nodes, edges, edge_scores, edge_lengths, start, end, feature_dict,
-                          population_size=50, generations=200, mutation_prob=0.2,
-                          alpha=0.6, beta=3, gamma=0.2, delta=0.5,
-                          max_path_length=None, cluster_eps=15.0):
+def _edge_key(u, v):
+    return (u, v)
+
+def get_edge_length(edge_lengths: Dict[Tuple[int,int], float], u: int, v: int, default: float = 1.0) -> float:
+    return edge_lengths.get((u,v), edge_lengths.get((v,u), default))
+
+def shortest_path(adjacency: Dict[int, List[int]],
+                  start: int, end: int,
+                  edge_lengths: Optional[Dict[Tuple[int,int], float]] = None) -> Optional[List[int]]:
     """
-    遗传算法规划从 start 到 end 的路径，目标：
-        - 最大化路径趣味性
-        - 最小化重复节点比例（加权）
-        - 最大化覆盖范围
-        - 减少同一区域重复访问（节点簇抽稀）
+    返回 start->end 的最短路径（如果 edge_lengths 给出，则用 Dijkstra 否则用 BFS）。
+    如果不可达，返回 None。
+    """
+    if start == end:
+        return [start]
+
+    if edge_lengths is None:
+        # 无权 BFS
+        q = deque([[start]])
+        seen = {start}
+        while q:
+            path = q.popleft()
+            node = path[-1]
+            for nb in adjacency.get(node, []):
+                if nb in seen:
+                    continue
+                if nb == end:
+                    return path + [nb]
+                seen.add(nb)
+                q.append(path + [nb])
+        return None
+    else:
+        # Dijkstra
+        pq = [(0.0, start, [start])]
+        dist = {start: 0.0}
+        while pq:
+            d, node, path = heapq.heappop(pq)
+            if node == end:
+                return path
+            if d > dist.get(node, float('inf')):
+                continue
+            for nb in adjacency.get(node, []):
+                nd = d + get_edge_length(edge_lengths, node, nb, default=1.0)
+                if nd < dist.get(nb, float('inf')):
+                    dist[nb] = nd
+                    heapq.heappush(pq, (nd, nb, path + [nb]))
+        return None
+
+def generate_candidate_paths(nodes, edges, edge_scores, start, end,
+                             score_percentile=0.9, k_paths=10, max_length=None):
+    """
+    生成候选路径集合：
+    1. 筛选异景程度较高的边作为关键边
+    2. 将关键边端点作为候选集
+    3. 在候选点之间用 K 最短路径算法找路径
+    4. 补充一些随机游走，增加多样性
 
     参数:
-        delta: 区域重复惩罚权重
-        cluster_eps: DBSCAN 聚类半径
+        nodes: dict[node_id] = (x,y)
+        edges: list of (i,j)
+        edge_scores: dict[(i,j)] = score
+        start, end: 指定起终点
+        score_percentile: 取多少百分位以上的边作为关键边
+        k_paths: 每对候选点之间取多少条最短路径
+        max_length: 最大路径长度（可选）
+
+    返回:
+        paths: list[list[node]]
     """
+    # --- 构造图 ---
+    G = nx.Graph()
+    for i, j in edges:
+        length = ((nodes[i][0] - nodes[j][0])**2 + (nodes[i][1] - nodes[j][1])**2)**0.5
+        G.add_edge(i, j, weight=length)
+
+    # --- 1. 选出高分边 ---
+    scores = list(edge_scores.values())
+    if not scores:
+        return []
+    threshold = np.percentile(scores, score_percentile * 100)
+    candidate_edges = [e for e, s in edge_scores.items() if s >= threshold]
+
+    # --- 2. 候选点集 ---
+    candidate_nodes = set()
+    for u, v in candidate_edges:
+        candidate_nodes.add(u)
+        candidate_nodes.add(v)
+
+    # 确保起点终点包含
+    candidate_nodes.add(start)
+    candidate_nodes.add(end)
+    candidate_nodes = list(candidate_nodes)
+
+    # --- 3. 在候选点对之间找 K 最短路径 ---
+    paths = []
+    for u in candidate_nodes:
+        for v in candidate_nodes:
+            if u == v:
+                continue
+            try:
+                gen = nx.shortest_simple_paths(G, u, v, weight="weight")
+                for k, p in zip(range(k_paths), gen):
+                    if max_length and len(p) > max_length:
+                        continue
+                    paths.append(p)
+            except nx.NetworkXNoPath:
+                continue
+
+    # --- 4. 补充随机游走 ---
+    def random_walk(start, steps=10):
+        path = [start]
+        current = start
+        for _ in range(steps):
+            neighbors = list(G.neighbors(current))
+            if not neighbors:
+                break
+            current = random.choice(neighbors)
+            path.append(current)
+        return path
+
+    for _ in range(k_paths):
+        paths.append(random_walk(start, steps=random.randint(5,15)))
+
+    # --- 5. 确保包含起点终点 ---
+    valid_paths = [p for p in paths if p[0] == start and p[-1] == end]
+    if not valid_paths:
+        try:
+            sp = nx.shortest_path(G, start, end, weight="weight")
+            valid_paths.append(sp)
+        except nx.NetworkXNoPath:
+            pass
+
+    return valid_paths
+
+def jaccard_similarity(set_a: Set[int], set_b: Set[int]) -> float:
+    if not set_a and not set_b:
+        return 1.0
+    inter = len(set_a & set_b)
+    uni = len(set_a | set_b)
+    return inter / uni if uni > 0 else 0.0
+
+def generate_initial_path(adjacency, nodes_coords, edges, edge_scores, edge_lengths,
+                          start, end, k_paths=50, max_length=40, score_percentile=0.9):
+    """
+    生成初始路径（保证起终点唯一、候选路径多样化）：
+    - 对 start==end 的情况，构造环
+    - 避免路径中重复出现起点，除闭环最后回到起点
+    """
+    import random
+
+    def next_node_choice(current, visited):
+        neighbors = adjacency[current]
+        if not neighbors:
+            return None
+        scores = [edge_scores.get((current, n), edge_scores.get((n, current), 0.1)) for n in neighbors]
+        total = sum(scores)
+        probs = [s / total for s in scores]
+        # 优先未访问节点
+        unvisited = [n for n in neighbors if n not in visited]
+        if unvisited:
+            unvisited_probs = [probs[neighbors.index(n)] for n in unvisited]
+            total_un = sum(unvisited_probs)
+            unvisited_probs = [p / total_un for p in unvisited_probs]
+            return random.choices(unvisited, weights=unvisited_probs, k=1)[0]
+        else:
+            return random.choices(neighbors, weights=probs, k=1)[0]
+
+    if start != end:
+        sp = shortest_path(adjacency, start, end, edge_lengths)
+        if sp is None:
+            raise ValueError(f"No path between start={start} and end={end}")
+        return sp
+
+    # start == end 构造环
+    coords_items = list(nodes_coords.items())
+    sx, sy = nodes_coords[start]
+
+    # 找 farthest 可连通节点
+    farthest = None
+    for nid, (x, y) in sorted(coords_items, key=lambda x: (x[1][0]-sx)**2 + (x[1][1]-sy)**2, reverse=True):
+        if nid == start:
+            continue
+        sp = shortest_path(adjacency, start, nid, edge_lengths)
+        if sp:
+            farthest = nid
+            break
+    if farthest is None:
+        return [start]
+
+    # 生成候选路径 start->farthest，排除 start 重复
+    paths = []
+    attempts = 0
+    while len(paths) < k_paths and attempts < k_paths*5:
+        attempts += 1
+        path = [start]
+        visited = {start}
+        current = start
+        while current != farthest and len(path) < max_length:
+            n = next_node_choice(current, visited)
+            if n is None or n == start:
+                break
+            path.append(n)
+            visited.add(n)
+            current = n
+        if current == farthest and path not in paths:
+            paths.append(path)
+
+    if not paths:
+        sp = shortest_path(adjacency, start, farthest, edge_lengths)
+        if sp is None:
+            return [start]
+        return sp + list(reversed(sp))[1:]
+
+    # 选择两条交集最小的路径
+    path_sets = [set(p) for p in paths]
+    best_pair = (0, 1)
+    best_score = None
+    n = len(paths)
+    for i in range(n):
+        for j in range(i+1, n):
+            s1, s2 = path_sets[i], path_sets[j]
+            inter = len(s1 & s2)
+            jac = jaccard_similarity(s1, s2)
+            score = (inter, jac)
+            if best_score is None or score < best_score:
+                best_score = score
+                best_pair = (i, j)
+
+    p1, p2 = paths[best_pair[0]], paths[best_pair[1]]
+    # 拼接形成环路，避免中间重复 start
+    p2_rev = list(reversed(p2))
+    merged = p1 + [n for n in p2_rev[1:] if n != start]
+    merged.append(start)  # 最后闭环回到起点
+    return merged
+
+
+
+
+def genetic_path_planning(nodes, edges, edge_scores, edge_lengths, start, end, feature_dict,
+                          population_size=50, generations=200, mutation_prob=0.2,
+                          alpha=0.6, beta=1.0, gamma=0.4, delta=0.02,
+                          max_path_length=None, cluster_eps=15.0):
+    """
+    遗传算法路径规划，保证起终点，考虑边重复、点重复、区域重复、趣味性、覆盖率。
+    """
+    import random
+    import numpy as np
+    from copy import deepcopy
+    from tqdm import tqdm
+    from sklearn.cluster import DBSCAN
+
+    # --- 构建邻接表 ---
     adjacency = {n: [] for n in nodes}
+    edge_set = set()
     for i, j in edges:
         adjacency[i].append(j)
         adjacency[j].append(i)
+        edge_set.add(tuple(sorted((i,j))))
 
     all_nodes_set = set(nodes.keys())
 
@@ -112,114 +359,99 @@ def genetic_path_planning(nodes, edges, edge_scores, edge_lengths, start, end, f
     clustering = DBSCAN(eps=cluster_eps, min_samples=1).fit(coords)
     node_cluster = {node_id: label for node_id, label in zip(nodes.keys(), clustering.labels_)}
 
-    # 绘图
-    plt.figure(figsize=(8, 8))
-    labels = clustering.labels_
-    unique_labels = set(labels)
-    colors = plt.cm.get_cmap("tab20", len(unique_labels))
-
-    for i, label in enumerate(unique_labels):
-        cluster_points = coords[labels == label]
-        plt.scatter(cluster_points[:, 0], cluster_points[:, 1],
-                    c=[colors(i)], label=f"Cluster {label}", s=50, alpha=0.6, edgecolors="k")
-
-    # 标注节点编号
-    for node_id, (x, y) in nodes.items():
-        plt.text(x, y, str(node_id), fontsize=8, ha="right", va="bottom")
-
-    plt.title("Node Clusters")
-    plt.xlabel("X")
-    plt.ylabel("Y")
-    plt.legend()
-    plt.gca().set_aspect("equal")
-    plt.grid(True)
-    plt.show()
-
     # --- 初始化种群 ---
-    def random_path():
-        path = [start]
-        visited = {start}
-        current = start
-        steps = 0
-        max_attempts = 1000
-        min_steps = 2
-
-        while (current != end or steps < min_steps) and steps < max_attempts:
-            neighbors = adjacency.get(current, [])
-            if not neighbors:
-                break
-            unvisited_neighbors = [n for n in neighbors if n not in visited]
-            next_node = random.choice(unvisited_neighbors) if unvisited_neighbors else random.choice(neighbors)
-            path.append(next_node)
-            visited.add(next_node)
-            current = next_node
-            steps += 1
-            if max_path_length and len(path) >= max_path_length:
-                break
-
-        if start == end and path[-1] != start:
-            path.append(start)
-        return path
-
-    population = [random_path() for _ in range(population_size)]
+    print("=== 初始化种群 ===")
+    population = [generate_initial_path(adjacency, nodes, edges, edge_scores, edge_lengths, start, end)
+                  for _ in tqdm(range(population_size), desc="初始化种群")]
+    for idx, path in enumerate(population):
+        print(f"个体 {idx+1}: {path}")
 
     # --- 适应度函数 ---
     def fitness(path):
-        # 1. 趣味性
         fun_score = compute_path_fun_score(path, edge_scores, edge_lengths, feature_dict)
 
-        # 2. 重复节点惩罚
-        counts = {}
-        for node in path:
-            counts[node] = counts.get(node, 0) + 1
-        weighted_repeat = sum((c - 1) for c in counts.values() if c > 1) / len(path)
+        # 边重复惩罚
+        counts_edge = {}
+        edge_penalty = 0.0
+        for k in range(len(path)-1):
+            e = tuple(sorted((path[k], path[k+1])))
+            counts_edge[e] = counts_edge.get(e,0) + 1
+            if counts_edge[e] == 2:
+                edge_penalty += 0.1
+            elif counts_edge[e] > 2:
+                edge_penalty += delta * (counts_edge[e]-2 + 1)
 
-        # 3. 区域重复惩罚
+        # 点重复惩罚
+        counts_node = {}
+        node_penalty = 0.0
+        for n in path:
+            counts_node[n] = counts_node.get(n,0) + 1
+            if counts_node[n] > 2:
+                node_penalty += delta * (counts_node[n]-3 + 1)
+
+        # 区域重复惩罚
         cluster_counts = {}
-        for node in path:
-            c = node_cluster[node]
-            cluster_counts[c] = cluster_counts.get(c, 0) + 1
-        cluster_penalty = sum(max(0, count - 2) for count in cluster_counts.values()) / len(path)
+        cluster_penalty = 0.0
+        for n in path:
+            c = node_cluster[n]
+            cluster_counts[c] = cluster_counts.get(c,0)+1
+            if cluster_counts[c] > 3:
+                cluster_penalty += delta*(cluster_counts[c]-3)
+        # cluster_penalty /= len(path)
 
-        # 4. 覆盖率
-        coverage = len(set(path)) / len(all_nodes_set)
+        # 覆盖率
+        coverage = len(set(path))/len(all_nodes_set)
 
-        return alpha * fun_score - beta * weighted_repeat - delta * cluster_penalty + gamma * coverage
+        return alpha*fun_score - beta*(edge_penalty + node_penalty + cluster_penalty) + gamma*coverage
 
     # --- 选择 ---
     def select_pair(pop):
         weights = np.array([fitness(p) for p in pop])
-        weights = np.maximum(weights, 0)
+        weights = np.maximum(weights,0)
         probs = weights / (weights.sum() + 1e-6)
         return random.choices(pop, probs, k=2)
 
     # --- 交叉 ---
     def crossover(p1, p2):
-        common = list(set(p1) & set(p2))
+        common = list(set(p1)&set(p2))
         if not common:
             return deepcopy(p1), deepcopy(p2)
         cross = random.choice(common)
-        i1 = p1.index(cross)
-        i2 = p2.index(cross)
-        child1 = p1[:i1] + p2[i2:]
-        child2 = p2[:i2] + p1[i1:]
+        i1, i2 = p1.index(cross), p2.index(cross)
+        # 拼接时保证边合法
+        child1 = p1[:i1 + 1]  # 保留交叉点
+        for node in p2[i2 + 1:]:  # 从交叉点之后开始
+            if tuple(sorted((child1[-1], node))) in edge_set:
+                child1.append(node)
+            else:
+                break
+
+        child2 = p2[:i2 + 1]
+        for node in p1[i1 + 1:]:
+            if tuple(sorted((child2[-1], node))) in edge_set:
+                child2.append(node)
+            else:
+                break
         return child1, child2
 
     # --- 变异 ---
     def mutate(path):
-        if len(path) < 2:
+        if len(path) < 3:
             return path
-        idx = random.randint(1, len(path) - 2)
-        node = path[idx]
-        neighbors = adjacency[path[idx - 1]]
-        path[idx] = random.choice(neighbors)
+        idx = random.randint(1, len(path)-2)
+        prev_node = path[idx-1]
+        next_node = path[idx+1]
+        # 可选邻居必须和前后节点合法连接
+        candidates = [n for n in adjacency[prev_node] if n != next_node and tuple(sorted((n,next_node))) in edge_set]
+        if candidates:
+            path[idx] = random.choice(candidates)
         return path
 
     # --- 主循环 ---
     best_path, best_score = None, -np.inf
     prev_best_score = None
 
-    for gen in tqdm(range(generations)):
+    for gen in tqdm(range(generations), desc="遗传算法迭代"):
         new_population = []
         while len(new_population) < population_size:
             p1, p2 = select_pair(population)
@@ -228,28 +460,23 @@ def genetic_path_planning(nodes, edges, edge_scores, edge_lengths, start, end, f
                 c1 = mutate(c1)
             if random.random() < mutation_prob:
                 c2 = mutate(c2)
-            new_population.extend([c1, c2])
+            new_population.extend([c1,c2])
         population = new_population[:population_size]
 
         # 更新最优
-        gen_best_score = -np.inf
-        gen_best_path = None
+        gen_best_score, gen_best_path = -np.inf, None
         for p in population:
             f = fitness(p)
             if f > gen_best_score:
                 gen_best_score = f
                 gen_best_path = p
 
-        # 提前停止条件
-        if prev_best_score is not None and abs(gen_best_score - prev_best_score) < 1e-6:
-            best_score = gen_best_score
-            best_path = gen_best_path
-            print(f"提前停止：第 {gen + 1} 代")
+        # 提前停止
+        if prev_best_score is not None and abs(gen_best_score-prev_best_score)<1e-8:
+            best_path, best_score = gen_best_path, gen_best_score
             break
-
         prev_best_score = gen_best_score
         if gen_best_score > best_score:
-            best_score = gen_best_score
-            best_path = gen_best_path
+            best_path, best_score = gen_best_path, gen_best_score
 
     return best_path, best_score

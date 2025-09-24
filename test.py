@@ -540,7 +540,7 @@ if __name__ == '__main__':
         node_, edge_, edge_length_ = load.load_graph_from_excel(path_file, offset)
 
         plot_landscape(landscape, node_, edge_)
-        plt.show()
+        # plt.show()
 
         # 构造指数衰减函数
         decay_fn = construct.exponential_decay(max_distance=50.0, lam=3.0)
@@ -568,7 +568,7 @@ if __name__ == '__main__':
             node_, edge_, edge_scores, edge_length_,
             start_point, end_point,feature_dict,
             population_size=50, generations=20,
-            alpha=0.6, beta=2, gamma=0.2
+            alpha=1.5, beta=1, gamma=1.2
         )
 
         print("最优路径：", best_path)

@@ -1,19 +1,20 @@
 import math
-from dataclasses import dataclass, field
-from typing import List, Tuple, Optional
+from typing import Callable, Dict, Any
+from typing import Tuple
 
-from matplotlib import pyplot as plt
-from shapely import STRtree
-import shapely
-from shapely.geometry import Point, Polygon, LineString
 import numpy as np
-from shapely.geometry import Point, Polygon
+import shapely
+from matplotlib import pyplot as plt
+from matplotlib.patches import Rectangle
+from matplotlib.path import Path
+from shapely import STRtree
+from shapely.geometry import Point, Polygon, box
 from shapely.geometry.linestring import LineString
-from shapely.geometry import Point, Polygon
-from typing import Callable, Dict,Any
 from shapely.validation import explain_validity
-
-from Rs_type import LandscapeElement, LandscapeCollection
+from sklearn.cluster import KMeans
+from tqdm import tqdm
+from  Rs_type import  LandscapeCollection
+import Rs_type
 
 
 def distance_decay(s: float, alpha: float = 0.1) -> float:
@@ -421,3 +422,273 @@ def compute_edge_hybrid_scores(
             D = float(beta * P + (1.0 - beta) * avg_mag)
         edge_scores[(u, v)] = D
     return edge_scores, mag_norm
+
+
+
+def compute_landscape_bounds(landscape):
+    """根据景观元素计算园林边界"""
+    xs, ys = [], []
+    for e in landscape.elements:
+        geom = e.geometry
+        if geom.type == "Polygon":
+            coords = geom.coordinates["shell"] if isinstance(geom.coordinates, dict) else geom.coordinates
+            if coords:
+                x_, y_ = zip(*coords)
+                xs.extend(x_)
+                ys.extend(y_)
+        elif geom.type == "Circle" and geom.center:
+            cx, cy = geom.center
+            r = geom.radius or 0
+            xs.extend([cx-r, cx+r])
+            ys.extend([cy-r, cy+r])
+        elif geom.center:
+            xs.append(geom.center[0])
+            ys.append(geom.center[1])
+    xmin, xmax = min(xs), max(xs)
+    ymin, ymax = min(ys), max(ys)
+    return xmin, ymin, xmax, ymax
+
+def point_in_polygon(point, polygon):
+    path = Path(polygon)
+    return path.contains_point(point)
+
+
+def compute_visibility(center: tuple,
+                       elements: list,
+                       boundary: Polygon,
+                       block_size: float):
+    """
+    基于面积加权的区块通视性计算（无需 shapel_geom 属性）
+    """
+    cx, cy = center
+    half = block_size / 2
+    block_polygon = box(cx - half, cy - half, cx + half, cy + half)
+
+    # 区块与边界取交集
+    block_polygon = block_polygon.intersection(boundary)
+    if block_polygon.is_empty or block_polygon.area == 0:
+        return 0.0
+
+    weighted_area_sum = 0.0
+    for e in elements:
+        geom = None
+        if e.geometry.type == "Polygon":
+            coords = e.geometry.coordinates
+            if isinstance(coords, dict):  # 带 holes
+                geom = Polygon(coords["shell"], coords.get("holes", []))
+            else:
+                geom = Polygon(coords)
+        elif e.geometry.type == "Circle" and e.geometry.center and e.geometry.radius:
+            geom = Point(e.geometry.center).buffer(e.geometry.radius, resolution=32)
+        if geom is not None:
+            transparency = getattr(e, 'transparent', 1.0)
+            inter = block_polygon.intersection(geom)
+            if not inter.is_empty:
+                weighted_area_sum += inter.area * transparency
+
+    visibility = weighted_area_sum / block_polygon.area
+    return np.clip(visibility, 0, 1)
+
+
+
+def grid_centers_from_bounds(bounds, nx=10, ny=10):
+    xmin, ymin, xmax, ymax = bounds
+    xs = np.linspace(xmin, xmax, nx+1)
+    ys = np.linspace(ymin, ymax, ny+1)
+    centers = [(0.5*(xs[i]+xs[i+1]), 0.5*(ys[j]+ys[j+1]))
+               for i in range(nx) for j in range(ny)]
+    return centers, xs, ys
+
+
+from shapely.geometry import Polygon, Point, box
+from shapely.strtree import STRtree
+from sklearn.cluster import KMeans
+from scipy.spatial import distance_matrix
+import numpy as np
+from tqdm import tqdm
+from matplotlib.patches import Rectangle, Patch
+from Rs_type import LandscapeElement
+
+def convert_to_shapely_geom(e: LandscapeElement):
+    g = e.geometry
+    if g.type == "Polygon":
+        coords = g.coordinates
+        if isinstance(coords, dict):  # 带 holes
+            return Polygon(coords["shell"], coords.get("holes", []))
+        else:
+            return Polygon(coords)
+    elif g.type == "Circle" and g.center and g.radius:
+        return Point(g.center).buffer(g.radius, resolution=32)
+    return None
+
+def analyze_openness_adaptive(
+    landscape: LandscapeCollection,
+    boundary: Polygon,
+    area=None,
+    max_distance=50.0,
+    block_size_ratio=1.0,
+    n_rays=36,
+    visualize=True
+):
+    """
+    自适应 KMeans 聚类分析园林开合变化
+
+    参数:
+        landscape: LandscapeCollection
+        boundary: shapely Polygon，景区边界
+        area: 景区面积，用于自适应 K 值
+        max_distance: 最大视线距离
+        block_size_ratio: 区块边长与 max_distance 的比例
+        n_rays: 每个中心点射线数量
+        visualize: 是否绘图
+
+    返回:
+        centers: 区块中心坐标列表
+        feature_matrix: 每个区块的完整特征向量（通视+结构特征）
+        openness_labels: 开阔/围合标签
+    """
+
+    # 1. 网格化边界
+    xmin, ymin, xmax, ymax = boundary.bounds
+    dx = dy = max_distance * block_size_ratio
+    nx = int(np.ceil((xmax - xmin) / dx))
+    ny = int(np.ceil((ymax - ymin) / dy))
+    xs = np.linspace(xmin + dx/2, xmax - dx/2, nx)
+    ys = np.linspace(ymin + dy/2, ymax - dy/2, ny)
+    centers = [(x, y) for y in ys for x in xs]
+
+    # 2. 自适应选择 K 值
+    if area is None:
+        k_clusters = 6
+    else:
+        k_clusters = int(np.clip(5 + (area - 0.5)/(5.0-0.5)*3, 5, 8))
+
+    # 3. 预生成 Shapely 几何对象索引
+    elems_list = []
+    geom_list = []
+    for e in landscape.elements:
+        g = convert_to_shapely_geom(e)
+        if g is not None:
+            elems_list.append(e)
+            geom_list.append(g)
+    tree = STRtree(geom_list)
+
+    # 4. 遍历每个区块
+    feature_matrix = []
+    visibilities = []
+
+    # --- 定义固定特征顺序 ---
+    element_types = ["water", "rock", "plant", "building"]
+    feature_names = []
+    for et in element_types:
+        feature_names += [
+            f"{et}_count",
+            f"{et}_total_area",
+            f"{et}_avg_area",
+            f"{et}_area_ratio",
+            f"{et}_mean_nn_dist",
+            f"{et}_std_nn_dist"
+        ]
+    for i, type_a in enumerate(element_types):
+        for type_b in element_types[i + 1:]:
+            feature_names += [
+                f"{type_a}_to_{type_b}_mean_dist",
+                f"{type_a}_to_{type_b}_std_dist"
+            ]
+    feature_names += ["all_elements_mean_nn_dist", "all_elements_std_nn_dist"]
+
+    for cx, cy in tqdm(centers, desc="计算区块特征与通视度"):
+        block_geom = Polygon([
+            (cx - dx / 2, cy - dy / 2),
+            (cx + dx / 2, cy - dy / 2),
+            (cx + dx / 2, cy + dy / 2),
+            (cx - dx / 2, cy + dy / 2)
+        ])
+
+        if not boundary.intersects(block_geom):
+            # 区块完全在边界外
+            visibilities.append(0.0)
+            feature_matrix.append([0.0] * (len(feature_names) + 1))  # +1 为通视度
+            continue
+
+        # 找出区块内景观元素
+        elems_in_block = [e for e, g in zip(elems_list, geom_list) if block_geom.intersects(g)]
+        if not elems_in_block:
+            visibilities.append(0.0)
+            feature_matrix.append([0.0] * (len(feature_names) + 1))
+            continue
+
+        # 计算区块特征向量
+        sub_landscape = LandscapeCollection(elems_in_block)
+        features = Rs_type.compute_landscape_features_extended(sub_landscape)
+
+        # 计算区块通视度
+        vis = compute_visibility((cx, cy), sub_landscape.elements, boundary, block_size=dx * 3)
+        visibilities.append(vis)
+
+        # 构建固定长度向量
+        feature_vec = [features.get(name, 0.0) for name in feature_names] + [vis]
+        feature_matrix.append(feature_vec)
+
+    # 转为 NumPy 数组
+    feature_matrix = np.array(feature_matrix)
+    visibilities = np.array(visibilities).reshape(-1, 1)
+
+    # 5. KMeans 聚类（非零通视度）
+    valid_idx = visibilities.flatten() > 0
+    if valid_idx.sum() >= k_clusters:
+        kmeans = KMeans(n_clusters=k_clusters, random_state=42).fit(feature_matrix[valid_idx])
+        labels_full = np.full(len(centers), -1, dtype=int)
+        labels_full[valid_idx] = kmeans.labels_
+        cluster_centers = kmeans.cluster_centers_
+    else:
+        labels_full = np.zeros(len(centers), dtype=int)
+        cluster_centers = np.zeros((1, feature_matrix.shape[1]))
+
+    # 6. 按通视度区分开阔/围合
+    idx_sorted = np.argsort(cluster_centers[:, -1])  # 用通视度排序
+    label_mapping = {old: 'enclosed' if i < k_clusters//2 else 'open' for i, old in enumerate(idx_sorted)}
+    openness_labels = ['boundary' if v==0 else label_mapping.get(l, 'open') for v, l in zip(visibilities.flatten(), labels_full)]
+
+    # 7. 可视化
+    if visualize:
+        fig, ax = plt.subplots(figsize=(12, 10))
+
+        # 颜色映射
+        label_colors = {
+            "boundary": "white",
+            "open": "blue",
+            "enclosed": "red"
+        }
+
+        for i, (cx, cy) in enumerate(centers):
+            label = openness_labels[i]
+            color = label_colors.get(label, "gray")  # 默认灰色防止异常
+            rect = Rectangle(
+                (cx - dx / 2, cy - dy / 2), dx, dy,
+                facecolor=color,
+                alpha=0.6 if label != "boundary" else 0.2,
+                edgecolor='black', linewidth=0.5
+            )
+            ax.add_patch(rect)
+
+            # 在区块中心显示开合标签
+            # ax.text(cx, cy, label, ha='center', va='center', fontsize=8, color='black')
+
+        # 设置图例
+        from matplotlib.patches import Patch
+        legend_elements = [
+            Patch(facecolor="blue", edgecolor='black', label="Open"),
+            Patch(facecolor="red", edgecolor='black', label="Enclosed"),
+            Patch(facecolor="white", edgecolor='black', label="Boundary")
+        ]
+        ax.legend(handles=legend_elements, loc='center left', bbox_to_anchor=(1, 0.5))
+
+        ax.set_xlim(xmin, xmax)
+        ax.set_ylim(ymin, ymax)
+        ax.set_aspect('equal')
+        ax.axis('off')
+        plt.title("园林空间开合聚类分析")
+        plt.show()
+
+    return centers, feature_matrix, openness_labels

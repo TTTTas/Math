@@ -1,30 +1,21 @@
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import itertools
 
 import ezdxf
-import math
-import numpy as np
-from collections import defaultdict
 import matplotlib.pyplot as plt
-from fontTools.ttx import process
-from joblib import Parallel, delayed
+import numpy as np
 import pandas as pd
-from shapely.geometry import Polygon, MultiPolygon
-from tqdm import tqdm
-from shapely.geometry import Polygon as ShapelyPolygon
-from multiprocessing import Pool, cpu_count
-from tqdm import tqdm
-import time
-
-import gener_path
-import pdf_test
-from Rs_type import LandscapeCollection, LandscapeElement, Geometry
 from matplotlib.patches import FancyArrowPatch, Polygon as MplPolygon
-import construct
+from shapely.geometry import Polygon as ShapelyPolygon
 
+import Rs_type
 import bound_shape
 import clusters
+import construct
+import gener_path
 import load
-import itertools
+from Rs_type import LandscapeCollection, LandscapeElement, Geometry
+from scipy.interpolate import splprep, splev
+
 
 # 设置中文字体
 plt.rcParams["font.sans-serif"] = ["SimHei"]
@@ -209,8 +200,7 @@ def process_building(gourp):
     # plt.show()
 
 from shapely.geometry import Polygon
-from dataclasses import dataclass, field
-from typing import List, Tuple, Optional, Dict
+from typing import Optional
 
 
 # ===== 辅助函数 =====
@@ -297,7 +287,7 @@ def process_water(group):
         )
         landscape.add_element(element)
 
-from shapely.geometry import Polygon, Point
+from shapely.geometry import Polygon
 
 import matplotlib.pyplot as plt
 
@@ -361,7 +351,7 @@ def plot_landscape(collection, nodes, edges, edge_path = None, edge_scores=None,
                 _, start_p, end_p = item
                 xs = [start_p[0], end_p[0]]
                 ys = [start_p[1], end_p[1]]
-                ax.plot(xs, ys, color="#DAA520", linewidth=2, label='Road')
+                ax.plot(xs, ys, color="#DAA520", linewidth=4, label='Road')
 
     from scipy.interpolate import splprep, splev
 
@@ -451,8 +441,217 @@ def plot_landscape(collection, nodes, edges, edge_path = None, edge_scores=None,
     # plt.show()
 
 
+import matplotlib.pyplot as plt
+from matplotlib.patches import FancyArrowPatch
+from scipy.interpolate import splprep, splev
+import numpy as np
 
-from joblib import Parallel, delayed
+import matplotlib.pyplot as plt
+from matplotlib.patches import Polygon as MplPolygon
+from scipy.interpolate import splprep, splev
+import numpy as np
+
+import matplotlib.pyplot as plt
+from matplotlib.patches import Polygon as MplPolygon
+from scipy.interpolate import splprep, splev
+import numpy as np
+
+
+def plot_path_only_transparent(nodes, edges, edge_paths=None, start_id=None, end_id=None, figsize=(10, 10)):
+    """
+    仅绘制路径和关键节点，背景透明，无坐标轴、方框、网格。
+
+    参数:
+        nodes: dict {node_id: (x, y)} 路径节点坐标
+        edges: list of (i,j) 路径边
+        edge_paths: dict {(i,j): [(x,y), ...]} 每条边的途径点，可选
+        start_id, end_id: 起点和终点 ID
+    """
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.set_aspect("equal")
+    ax.set_facecolor("none")  # 背景透明
+    ax.axis("off")  # 关闭坐标轴和边框
+
+    # --- 绘制路径 ---
+    for i, j in edges:
+        x1, y1 = nodes[i]
+        x2, y2 = nodes[j]
+
+        path_points = None
+        if edge_paths:
+            if (i, j) in edge_paths:
+                path_points = edge_paths[(i, j)]
+            elif (j, i) in edge_paths:
+                path_points = list(reversed(edge_paths[(j, i)]))
+
+        if path_points:
+            xs, ys = zip(*path_points)
+            if len(xs) >= 4:
+                tck, _ = splprep([xs, ys], s=0)
+                unew = np.linspace(0, 1.0, 50)
+                xs_smooth, ys_smooth = splev(unew, tck)
+            else:
+                xs_smooth, ys_smooth = xs, ys
+            ax.plot(xs_smooth, ys_smooth, color="red", linewidth=3, zorder=2)
+        else:
+            ax.plot([x1, x2], [y1, y2], color="red", linewidth=3, zorder=2)
+
+    # --- 绘制路径节点（黄色三角形+黑边）---
+    for nid, (x, y) in nodes.items():
+        ax.scatter(x, y, marker="^", s=60, facecolor="yellow", edgecolor="black", zorder=3)
+
+    # --- 绘制起点和终点 ---
+    if start_id is not None and end_id is not None:
+        if start_id == end_id:
+            x, y = nodes[start_id]
+            ax.scatter(x, y, color="purple", s=80, zorder=10)
+        else:
+            xs, ys = nodes[start_id]
+            xe, ye = nodes[end_id]
+            ax.scatter(xs, ys, color="#476DF8", s=80, zorder=10)
+            ax.scatter(xe, ye, color="#DE2A2A", s=80, zorder=10)
+
+    plt.show()
+
+def plot_path_only(collection, nodes, edges, edge_score=None, edge_paths=None, start_id=None, end_id=None, figsize=(10, 10)):
+    """
+    绘制路径和景观轮廓（无填充，水体、假山线条加粗，植被绘制点）
+    如果 edge_score 不为 None，则用颜色表示每条边的分数，并添加颜色柱。
+    """
+    plt.figure(figsize=figsize)
+    ax = plt.gca()
+    ax.set_aspect("equal")
+    plt.grid(True)
+
+    # 绘制景观轮廓
+    for element in collection.elements:
+        geom = element.geometry
+
+        if element.type == "water":
+            color = "#83E6FF"
+            lw = 2
+        elif element.type == "rock":
+            color = "#FD6912"
+            lw = 2
+        elif element.type == "building":
+            color = "black"
+            lw = 2
+        elif element.type == "plant":
+            continue
+        else:
+            color = "gray"
+            lw = 1.5
+
+        if geom.type == "Polygon":
+            if element.type == "water":
+                shell = list(geom.coordinates["shell"])
+                holes = [list(h) for h in geom.coordinates.get("holes", [])]
+
+                patch = MplPolygon(shell, closed=True, fill=False, edgecolor=color, linewidth=lw)
+                ax.add_patch(patch)
+
+                for hole in holes:
+                    hole_patch = MplPolygon(hole, closed=True, fill=False, edgecolor=color, linewidth=lw)
+                    ax.add_patch(hole_patch)
+            else:
+                coords = geom.coordinates
+                if isinstance(coords, list) and len(coords) > 2:
+                    xs, ys = zip(*coords)
+                    ax.plot(xs, ys, color=color, linewidth=lw)
+
+        elif geom.type == "Circle":
+            center = geom.center
+            radius = geom.radius
+            circle = plt.Circle(center, radius, fill=False, color=color, linewidth=lw)
+            ax.add_patch(circle)
+
+        elif geom.type == "Point":
+            x, y = geom.coordinates
+            ax.plot(x, y, "o", color=color)
+    from matplotlib.colors import Normalize
+    import matplotlib.cm as cm
+    from matplotlib.colors import PowerNorm
+    # 绘制路径
+    if edge_score is not None:
+        # 使用颜色映射 edge_score
+        scores = np.array([s if np.isscalar(s) else np.mean(s) for s in edge_score.values()])
+        cmap = cm.plasma
+        norm = PowerNorm(gamma=0.5, vmin=np.percentile(scores, 5), vmax=np.percentile(scores, 95))
+        lc_segments = []
+        lc_colors = []
+
+        for i, j in edges:
+            x1, y1 = nodes[i]
+            x2, y2 = nodes[j]
+
+            path_points = None
+            if edge_paths:
+                if (i, j) in edge_paths:
+                    path_points = edge_paths[(i, j)]
+                elif (j, i) in edge_paths:
+                    path_points = list(reversed(edge_paths[(j, i)]))
+
+            if path_points:
+                xs, ys = zip(*path_points)
+                if len(xs) >= 4:
+                    tck, _ = splprep([xs, ys], s=0)
+                    unew = np.linspace(0, 1.0, 100)
+                    xs_smooth, ys_smooth = splev(unew, tck)
+                else:
+                    xs_smooth, ys_smooth = xs, ys
+            else:
+                xs_smooth, ys_smooth = [x1, x2], [y1, y2]
+
+            lc_segments.append(np.column_stack([xs_smooth, ys_smooth]))
+            lc_colors.append(cmap(norm(edge_score.get((i,j), edge_score.get((j,i), 0)))))
+
+        lc = LineCollection(lc_segments, colors=lc_colors, linewidths=4, zorder=2)
+        ax.add_collection(lc)
+        cbar = plt.colorbar(cm.ScalarMappable(norm=norm, cmap=cmap), ax=ax)
+        cbar.set_label("Edge Score")
+
+    else:
+        for i, j in edges:
+            x1, y1 = nodes[i]
+            x2, y2 = nodes[j]
+
+            path_points = None
+            if edge_paths:
+                if (i, j) in edge_paths:
+                    path_points = edge_paths[(i, j)]
+                elif (j, i) in edge_paths:
+                    path_points = list(reversed(edge_paths[(j, i)]))
+
+            if path_points:
+                xs, ys = zip(*path_points)
+                if len(xs) >= 4:
+                    tck, _ = splprep([xs, ys], s=0)
+                    unew = np.linspace(0, 1.0, 100)
+                    xs_smooth, ys_smooth = splev(unew, tck)
+                else:
+                    xs_smooth, ys_smooth = xs, ys
+                ax.plot(xs_smooth, ys_smooth, color="red", linewidth=4, zorder=2)
+            else:
+                ax.plot([x1, x2], [y1, y2], color="red", linewidth=4, zorder=2)
+
+    # 绘制路径节点
+    for nid, (x, y) in nodes.items():
+        ax.scatter(x, y, marker="^", s=60, facecolor="yellow", edgecolor="black", zorder=4)
+
+    # 绘制起点和终点
+    if start_id is not None and end_id is not None:
+        if start_id == end_id:
+            x, y = nodes[start_id]
+            ax.scatter(x, y, color="purple", s=80, zorder=5, label="Start/End")
+        else:
+            xs, ys = nodes[start_id]
+            xe, ye = nodes[end_id]
+            ax.scatter(xs, ys, color="#476DF8", s=80, zorder=5, label="Start")
+            ax.scatter(xe, ye, color="#DE2A2A", s=80, zorder=5, label="End")
+
+    plt.title("路径规划结果")
+    plt.show()
+
 from tqdm import tqdm
 
 
@@ -536,41 +735,309 @@ def find_closest_node(nodes_coords, point):
     closest_idx = np.argmin(dists)
     return node_ids[closest_idx]
 
+
+import networkx as nx
+from itertools import combinations
+from collections import deque
+
+
+def is_connected_after_removal(nodes, edges, remove_edge):
+    """检查删除某条边后图是否仍连通"""
+    u, v = remove_edge
+    adj = {n: set() for n in nodes}
+    for a, b in edges:
+        if (a, b) == remove_edge or (b, a) == remove_edge:
+            continue
+        adj[a].add(b)
+        adj[b].add(a)
+
+    # BFS 从 u 出发能否到达 v
+    visited = set([u])
+    queue = deque([u])
+    while queue:
+        cur = queue.popleft()
+        for nei in adj[cur]:
+            if nei not in visited:
+                visited.add(nei)
+                queue.append(nei)
+    return v in visited
+
+
+def simplify_graph(nodes, edges, edge_lengths, edge_paths, threshold=1.2):
+    """
+    简化图：删除冗余边（三角形中最长边），保证连通性
+    """
+    edges = set(tuple(sorted(e)) for e in edges)  # 无序化
+    new_edges = edges.copy()
+    new_edge_lengths = edge_lengths.copy()
+    new_edge_paths = edge_paths.copy()
+
+    # --- Step 1: 删除三角形中最长边 ---
+    adjacency = {n: set() for n in nodes}
+    for u, v in edges:
+        adjacency[u].add(v)
+        adjacency[v].add(u)
+
+    for a in nodes:
+        neighbors = list(adjacency[a])
+        for b, c in combinations(neighbors, 2):
+            if b in adjacency[c]:  # 存在三角形 a-b-c
+                d_ab = edge_lengths.get(tuple(sorted((a, b))), float("inf"))
+                d_bc = edge_lengths.get(tuple(sorted((b, c))), float("inf"))
+                d_ac = edge_lengths.get(tuple(sorted((a, c))), float("inf"))
+                # 找最长边
+                longest = max(
+                    [(d_ab, tuple(sorted((a, b)))),
+                     (d_bc, tuple(sorted((b, c)))),
+                     (d_ac, tuple(sorted((a, c))))],
+                    key=lambda x: x[0]
+                )[1]
+                # 检查删除后是否仍连通
+                if longest in new_edges and is_connected_after_removal(nodes, new_edges, longest):
+                    new_edges.remove(longest)
+                    new_edge_lengths.pop(longest, None)
+                    new_edge_paths.pop(longest, None)
+
+    # --- Step 2: 用 MST 保证连通性 ---
+    G = nx.Graph()
+    for u, v in new_edges:
+        G.add_edge(u, v, weight=new_edge_lengths[(u, v)])
+
+    mst = nx.minimum_spanning_tree(G)
+    mst_edges = set(tuple(sorted(e)) for e in mst.edges())
+
+    # 保证至少 MST 边保留
+    for e in mst_edges:
+        if e not in new_edges:
+            new_edges.add(e)
+            new_edge_lengths[e] = edge_lengths[e]
+            new_edge_paths[e] = edge_paths[e]
+
+    return new_edges, new_edge_lengths, new_edge_paths
+
+from scipy.stats import entropy
+
+def compute_garden_mystic_score(feature_matrix: np.ndarray, openness_labels: list) -> float:
+    """
+    计算单个园林的幻境评分。
+
+    参数:
+        feature_matrix: np.ndarray, shape=(n_blocks, n_features)，每个区块的特征向量（已融合通视度）
+        openness_labels: list of str, 每个区块的开合标签 ('open', 'enclosed', 'boundary')
+
+    返回:
+        score: float, 幻境感评分（0-100）
+    """
+    n_blocks = len(openness_labels)
+    if n_blocks == 0:
+        return 0.0
+
+    # 1. 区块特征丰富度
+    feature_matrix = np.array(feature_matrix, dtype=float)
+    # 避免维度不一致
+    if feature_matrix.ndim != 2:
+        raise ValueError("feature_matrix 必须为二维数组 (n_blocks, n_features)")
+
+    # 归一化每个特征
+    f_min = np.min(feature_matrix, axis=0)
+    f_max = np.max(feature_matrix, axis=0)
+    f_range = np.where(f_max - f_min == 0, 1, f_max - f_min)
+    feature_norm = (feature_matrix - f_min) / f_range
+
+    # 每个区块的特征丰富度（方差或熵）
+    block_diversity = feature_norm.var(axis=1)  # 方差表示多样性
+    feature_richness = block_diversity.mean()   # 全园平均
+
+    # 2. 开合变化指标
+    # boundary区块排除
+    labels_numeric = [1 if l=='open' else 0 for l in openness_labels if l in ['open','enclosed']]
+    if len(labels_numeric) < 2:
+        openness_entropy = 0.0
+    else:
+        # 熵
+        counts = np.bincount(labels_numeric, minlength=2)
+        probs = counts / counts.sum()
+        openness_entropy = entropy(probs)  # 最大为 ln(2)
+
+    # 3. 综合评分
+    # 特征丰富度和开合变化各占50%
+    raw_score = 0.5 * feature_richness + 0.5 * (openness_entropy / np.log(2))  # 归一化到0~1
+
+    # 映射到0~100
+    score = raw_score * 100
+    return score
+
+# =======第一问=======
+def Process_Q1(landscape_, garden_):
+    offset = garden_["offset"]
+    start_point = garden_["start"]
+    end_point = garden_["end"]
+    node_, tmp_edge_, tmp_edge_length_, tmp_edge_paths_ = load.load_graph_from_excel(path_file, offset)
+    edge_, edge_length_, edge_paths_ = simplify_graph(
+        node_, tmp_edge_, tmp_edge_length_, tmp_edge_paths_
+    )
+    start_id = find_closest_node(node_, start_point)
+    end_id = find_closest_node(node_, end_point)
+    result_path = garden_["result"]
+    if result_path is not None:
+        df = pd.read_excel(result_path)
+
+        # 转换成 {node_id: (x, y)}
+        result_nodes = {int(row["node_id"]): (row["x"], row["y"]) for _, row in df.iterrows()}
+
+        # 边列表（相邻节点相连）
+        node_ids = df["node_id"].tolist()
+        result_edges = [(node_ids[i], node_ids[i + 1]) for i in range(len(node_ids) - 1)]
+        plot_path_only_transparent(result_nodes, result_edges, tmp_edge_paths_, start_id, end_id)
+        plot_path_only(landscape_, result_nodes, result_edges, tmp_edge_paths_, start_id, end_id)
+        return None
+
+    # plot_landscape(landscape, node_, edge_, edge_path=edge_paths_, start_=start_id, end_=end_id)
+    # plt.show()
+
+    # 构造指数衰减函数
+    decay_fn = construct.exponential_decay(max_distance=50.0, lam=3.0)
+    # for i in tqdm(range(60,75,1)):
+    #     f_v = construct.construct_sector_feature_vector_fast(landscape, node_[i], n_sectors=16,decay_func=decay_fn)
+    #     construct.plot_sector_feature_vector(f_v, 16)
+    #     plt.title(f"Scatter{i}")
+    # plt.show()
+    # f_v = construct.construct_sector_feature_vector_fast(landscape, node_[55], n_sectors=16,decay_func=decay_fn)
+    # construct.plot_sector_feature_vector(f_v, 16)
+    # plt.title(f"Scatter{55}")
+    # plt.show()
+
+    # 1. 计算所有节点的特征向量
+    feature_dict = compute_feature_vectors_for_nodes(
+        landscape_,
+        node_,  # dxf_path_to_graph 返回的 nodes
+        n_sectors=16,
+        rays_per_sector=4,
+        max_distance=30.0,
+        decay_func=decay_fn
+    )
+
+    # 2. 计算所有边的异景程度
+    edge_scores = compute_edge_scores(node_, edge_, feature_dict)
+
+
+    # plot_landscape(landscape, node_, edge_, edge_scores=edge_scores)
+    # plt.show()
+
+    # 1. 调用遗传算法规划路径
+    best_path, best_score = gener_path.genetic_path_planning(
+        node_, edge_, edge_scores, edge_length_,
+        start=start_id, end=end_id,feature_dict=feature_dict,
+        population_size=100, generations=100,
+        alpha=4, beta=3, gamma=6.5, delta=0.03, cluster_eps=5.0
+    )
+
+    print("最优路径：", best_path)
+    print("最优路径综合评分：", best_score)
+
+    # 2. 将路径转为边列表用于绘图
+    path_edges = [(best_path[i], best_path[i + 1]) for i in range(len(best_path) - 1)]
+
+    # 提取路径节点（仅保留在路径上的节点）
+    path_nodes = {idx: node_[idx] for idx in best_path}
+    # 转换为 DataFrame
+    df = pd.DataFrame([
+        {"node_id": nid, "x": coord[0], "y": coord[1]}
+        for nid, coord in path_nodes.items()
+    ])
+
+    # 保存到 Excel
+    excel_path = "path_nodes.xlsx"
+    df.to_excel(excel_path, index=False)
+
+    print(f"路径节点已保存到 {excel_path}")
+
+
+    # 3. 可视化景观与路径
+    plot_landscape(
+        collection=landscape_,
+        nodes=path_nodes,
+        edges=path_edges,  # 只绘制路径边
+        edge_path=edge_paths_,
+        plant_paths=road_path,
+        start_=start_id, end_=end_id,
+        figsize=(12, 12)
+    )
+    plt.show()
+
+    return 1
+
+# ======第二问====== #
+def Process_Q2(landscape_, garden_):
+    # 1. 生成特征向量
+    features = Rs_type.compute_landscape_features_extended(landscape_)
+
+    # 2. 可视化特征向量
+    Rs_type.visualize_landscape_features(features)
+
+    area = garden_["area"]
+    boundary = load.read_boundary_from_dxf(garden_["boundary"])
+    centers, feature_matrix, openness_labels = construct.analyze_openness_adaptive(
+        landscape=landscape,
+        boundary=boundary,
+        area=area,  # 景区面积（万㎡），可自适应 K 值
+        max_distance=50.0,  # 区块可视距离
+        block_size_ratio=0.3,  # 区块边长与 max_distance 比例
+        visualize=True  # 是否绘图
+    )
+
+    score = compute_garden_mystic_score(feature_matrix, openness_labels)
+    print(score)
+
+    return feature_matrix
+
 if __name__ == '__main__':
     wights = {'building': 2.0, 'rock': 1.5, 'plant': 0.65, 'water': 1.5}
     # 每个园林的 DXF 文件、路径 Excel 文件、坐标偏移
     garden_data = [
-        # {
-        #     "name": "拙政园",
-        #     "dxf_file": "赛题F江南古典园林美学特征建模附件资料/1. 拙政园/2-拙政园平面矢量图.dxf",
-        #     "path_file": "赛题F江南古典园林美学特征建模附件资料/1. 拙政园/keypoints(3).xlsx",
-        #     "offset": (9.8491329, -10.8432441),
-        #     "start": (151.2011329,9.7517559),
-        #     "end": (151.2011329,9.7517559)
-        # },
+        {
+            "name": "拙政园",
+            "dxf_file": "赛题F江南古典园林美学特征建模附件资料/1. 拙政园/2-拙政园平面矢量图.dxf",
+            "path_file": "赛题F江南古典园林美学特征建模附件资料/1. 拙政园/keypoints(3).xlsx",
+            "offset": (9.8491329, -10.8432441),
+            "start": (151.2011329,9.7517559),
+            "end": (151.2011329,9.7517559),
+            "result": "赛题F江南古典园林美学特征建模附件资料/1. 拙政园/结果/path_nodes.xlsx",
+            "area": 5.2,
+            "boundary":"赛题F江南古典园林美学特征建模附件资料/boundarys/2-拙政园平面矢量图-boundary.dxf"
+        },
         # {
         #     "name": "留园",
         #     "dxf_file": "赛题F江南古典园林美学特征建模附件资料/2. 留园/2-留园平面矢量图.dxf",
         #     "path_file": "赛题F江南古典园林美学特征建模附件资料/2. 留园/keypoints_15_6.xlsx",
         #     "offset": (-0.9796737, -0.0270097),
         #     "start": (91.98,15.625),
-        #     "end": (91.98,15.625)
+        #     "end": (91.98,15.625),
+        #     "result": "赛题F江南古典园林美学特征建模附件资料/2. 留园/结果/path_nodes.xlsx",
+        #     "area": 2.3,
+        #     "boundary":"赛题F江南古典园林美学特征建模附件资料/boundarys/2-留园平面矢量图-boundary.dxf"
         # },
-        # {
-        #     "name": "寄畅园",
-        #     "dxf_file": "赛题F江南古典园林美学特征建模附件资料/3. 寄畅园/2-寄畅园平面矢量图.dxf",
-        #     "path_file": "赛题F江南古典园林美学特征建模附件资料/3. 寄畅园/keypoints_8_5.xlsx",
-        #     "offset": (-0.1977373, -0.2680043),
-        #     "start": (60.02,103.43),
-        #     "end": (60.02,103.43)
-        # },
+        {
+            "name": "寄畅园",
+            "dxf_file": "赛题F江南古典园林美学特征建模附件资料/3. 寄畅园/2-寄畅园平面矢量图.dxf",
+            "path_file": "赛题F江南古典园林美学特征建模附件资料/3. 寄畅园/keypoints_8_5.xlsx",
+            "offset": (-0.1977373, -0.2680043),
+            "start": (60.02,103.43),
+            "end": (60.02,103.43),
+            "result": "赛题F江南古典园林美学特征建模附件资料/3. 寄畅园/结果/path_nodes.xlsx",
+            "area": 0.8,
+            "boundary":"赛题F江南古典园林美学特征建模附件资料/boundarys/2-寄畅园平面矢量图-boundary.dxf"
+        },
         # {
         #     "name": "瞻园",
         #     "dxf_file": "赛题F江南古典园林美学特征建模附件资料/4. 瞻园/2-瞻园平面矢量图.dxf",
         #     "path_file": "赛题F江南古典园林美学特征建模附件资料/4. 瞻园/keypoints_8_5.xlsx",
         #     "offset": (-1.9268614, -0.8434156),
         #     "start": (92.7846474,0.5689201),
-        #     "end": (92.7846474,0.5689201)
+        #     "end": (92.7846474,0.5689201),
+        #     "result": "赛题F江南古典园林美学特征建模附件资料/4. 瞻园/结果/path_nodes.xlsx",
+        #     "area": 0.6,
+        #     "boundary":"赛题F江南古典园林美学特征建模附件资料/boundarys/2-瞻园平面矢量图-boundary.dxf"
         # },
         # {
         #     "name": "豫园",
@@ -578,7 +1045,10 @@ if __name__ == '__main__':
         #     "path_file": "赛题F江南古典园林美学特征建模附件资料/5. 豫园/keypoints_12_5.xlsx",
         #     "offset": (-3.2157811, -21.6134844),
         #     "start": (-11.2,57.45),
-        #     "end": (-75.8,129.7)
+        #     "end": (-75.8,129.7),
+        #     "result": "赛题F江南古典园林美学特征建模附件资料/5. 豫园/结果/path_nodes.xlsx",
+        #     "area": 2.5,
+        #     "boundary":"赛题F江南古典园林美学特征建模附件资料/boundarys/2-豫园矢量平面图-boundary.dxf"
         # },
         # {
         #     "name": "秋霞圃",
@@ -586,7 +1056,10 @@ if __name__ == '__main__':
         #     "path_file": "赛题F江南古典园林美学特征建模附件资料/6. 秋霞圃/keypoints_8_5.xlsx",
         #     "offset": (-7.6288985, -7.1803547),
         #     "start": (101.2160972,13.208431),
-        #     "end": (101.2160972,13.208431)
+        #     "end": (101.2160972,13.208431),
+        #     "result": "赛题F江南古典园林美学特征建模附件资料/6. 秋霞圃/结果/path_nodes.xlsx",
+        #     "area": 1.0,
+        #     "boundary":"赛题F江南古典园林美学特征建模附件资料/boundarys/2-秋霞圃平面矢量图-boundary.dxf"
         # },
         # {
         #     "name": "沈园",
@@ -594,23 +1067,32 @@ if __name__ == '__main__':
         #     "path_file": "赛题F江南古典园林美学特征建模附件资料/7. 沈园/keypoints_10_5.xlsx",
         #     "offset": (-0.9630922, -4.5601914),
         #     "start": (60.12,135.74),
-        #     "end": (60.12,135.74)
+        #     "end": (60.12,135.74),
+        #     "result": "赛题F江南古典园林美学特征建模附件资料/7. 沈园/结果/path_nodes.xlsx",
+        #     "area": 3.2,
+        #     "boundary":"赛题F江南古典园林美学特征建模附件资料/boundarys/2-沈园平面矢量图-boundary.dxf"
         # },
-        {
-            "name": "怡园",
-            "dxf_file": "赛题F江南古典园林美学特征建模附件资料/8. 怡园/2-怡园平面矢量图.dxf",
-            "path_file": "赛题F江南古典园林美学特征建模附件资料/8. 怡园/keypoints_8_3.xlsx",
-            "offset": (-217.8108044, 5.0781872),
-            "start": (60.12,135.74),
-            "end": (-148.6982585,1.6179871)
-        },
+        # {
+        #     "name": "怡园",
+        #     "dxf_file": "赛题F江南古典园林美学特征建模附件资料/8. 怡园/2-怡园平面矢量图.dxf",
+        #     "path_file": "赛题F江南古典园林美学特征建模附件资料/8. 怡园/keypoints_8_3.xlsx",
+        #     "offset": (-217.8108044, 5.0781872),
+        #     "start": (60.12,135.74),
+        #     "end": (-148.6982585,1.6179871),
+        #     "result": "赛题F江南古典园林美学特征建模附件资料/8. 怡园/结果/path_nodes.xlsx",
+        #     "area": 1.8,
+        #     "boundary":"赛题F江南古典园林美学特征建模附件资料/boundarys/2-怡园平面矢量图-boundary.dxf"
+        # },
         # {
         #     "name": "耦园",
         #     "dxf_file": "赛题F江南古典园林美学特征建模附件资料/9. 耦园/2-耦园平面矢量图.dxf",
         #     "path_file": "赛题F江南古典园林美学特征建模附件资料/9. 耦园/keypoints_3_4.xlsx",
         #     "offset": (70.3353057, 18.964422),
         #     "start": (61,65.7),
-        #     "end": (61,65.7)
+        #     "end": (61,65.7),
+        #     "result": "赛题F江南古典园林美学特征建模附件资料/9. 耦园/结果/path_nodes.xlsx",
+        #     "area": 3.8,
+        #     "boundary":"赛题F江南古典园林美学特征建模附件资料/boundarys/2-耦园平面矢量图-boundary.dxf"
         # },
         # {
         #     "name": "绮园",
@@ -618,16 +1100,16 @@ if __name__ == '__main__':
         #     "path_file": "赛题F江南古典园林美学特征建模附件资料/10. 绮园/keypoints_5_8.xlsx",
         #     "offset": (-0.3160398, -4.4043545),
         #     "start": (4.5,6.7),
-        #     "end": (4.5,6.7)
+        #     "end": (4.5,6.7),
+        #     "result": "赛题F江南古典园林美学特征建模附件资料/10. 绮园/结果/path_nodes.xlsx",
+        #     "area": 1.0,
+        #     "boundary":"赛题F江南古典园林美学特征建模附件资料/boundarys/2-绮园平面矢量图-boundary.dxf"
         # },
     ]
 
     for garden in garden_data:
         dxf_file = garden["dxf_file"]
         path_file = garden["path_file"]
-        offset = garden["offset"]
-        start_point = garden["start"]
-        end_point = garden["end"]
 
 
         print(f"\n=== 解析园林: {garden['name']} ===")
@@ -636,10 +1118,7 @@ if __name__ == '__main__':
         msp = doc.modelspace()
 
         grouped, all_entities = load.parse_and_classify_dxf(msp)
-        node_, edge_, edge_length_, edge_paths_ = load.load_graph_from_excel(path_file, offset)
-        start_id = find_closest_node(node_, start_point)
-        end_id = find_closest_node(node_, end_point)
-        
+
         landscape = LandscapeCollection()
         # 水体
         process_water(grouped)
@@ -657,76 +1136,50 @@ if __name__ == '__main__':
         # input()
         # plot_landscape(landscape, node_, edge_)
 
-        road_path = grouped.get("道路", []) 
-        plot_landscape(landscape, node_, edge_, edge_path=edge_paths_, start_=start_id, end_=end_id)
-        plt.show()
+        road_path = grouped.get("道路", [])
 
-        # 构造指数衰减函数
-        decay_fn = construct.exponential_decay(max_distance=50.0, lam=3.0)
-        # for i in tqdm(range(60,75,1)):
-        #     f_v = construct.construct_sector_feature_vector_fast(landscape, node_[i], n_sectors=16,decay_func=decay_fn)
-        #     construct.plot_sector_feature_vector(f_v, 16)
-        #     plt.title(f"Scatter{i}")
-        # plt.show()
-        # f_v = construct.construct_sector_feature_vector_fast(landscape, node_[55], n_sectors=16,decay_func=decay_fn)
-        # construct.plot_sector_feature_vector(f_v, 16)
-        # plt.title(f"Scatter{55}")
-        # plt.show()
+        # Process_Q1(landscape, garden)
+        # Process_Q2(landscape, garden)
+        result_path = garden["result"]
+        if result_path is not None:
+            offset = garden["offset"]
+            start_point = garden["start"]
+            end_point = garden["end"]
+            node_, tmp_edge_, tmp_edge_length_, tmp_edge_paths_ = load.load_graph_from_excel(path_file, offset)
+            edge_, edge_length_, edge_paths_ = simplify_graph(
+                node_, tmp_edge_, tmp_edge_length_, tmp_edge_paths_
+            )
 
-        # 1. 计算所有节点的特征向量
-        feature_dict = compute_feature_vectors_for_nodes(
-            landscape,
-            node_,  # dxf_path_to_graph 返回的 nodes
-            n_sectors=16,
-            rays_per_sector=4,
-            max_distance=30.0,
-            decay_func=decay_fn
-        )
+            df = pd.read_excel(result_path)
 
-        # 2. 计算所有边的异景程度
-        edge_scores = compute_edge_scores(node_, edge_, feature_dict)
+            # 转换成 {node_id: (x, y)}
+            result_nodes = {int(row["node_id"]): (row["x"], row["y"]) for _, row in df.iterrows()}
+            start_id = find_closest_node(result_nodes, start_point)
+            end_id = find_closest_node(result_nodes, end_point)
+            # 边列表（相邻节点相连）
+            node_ids = df["node_id"].tolist()
+            edge_set = set()
+            for i in range(len(node_ids) - 1):
+                u, v = node_ids[i], node_ids[i + 1]
+                edge_set.add(frozenset([u, v]))  # frozenset 无序，u-v 和 v-u 会被认为相同
+
+            # 转回 tuple 列表形式
+            result_edges = [tuple(e) for e in edge_set]
+
+            decay_fn = construct.exponential_decay(max_distance=50.0, lam=3.0)
+
+            # 1. 计算所有节点的特征向量
+            feature_dict = compute_feature_vectors_for_nodes(
+                landscape,
+                result_nodes,  # dxf_path_to_graph 返回的 nodes
+                n_sectors=16,
+                rays_per_sector=4,
+                max_distance=30.0,
+                decay_func=decay_fn
+            )
+
+            # 2. 计算所有边的异景程度
+            edge_scores = compute_edge_scores(result_nodes, result_edges, feature_dict)
+            plot_path_only(landscape, result_nodes, result_edges, edge_paths=tmp_edge_paths_, start_id=start_id, end_id=end_id)
 
 
-        # plot_landscape(landscape, node_, edge_, edge_scores=edge_scores)
-        # plt.show()
-
-        # 1. 调用遗传算法规划路径
-        best_path, best_score = gener_path.genetic_path_planning(
-            node_, edge_, edge_scores, edge_length_,
-            start=start_id, end=end_id,feature_dict=feature_dict,
-            population_size=100, generations=100,
-            alpha=4.2, beta=1.8, gamma=6, delta=0.02, cluster_eps=5.0
-        )
-
-        print("最优路径：", best_path)
-        print("最优路径综合评分：", best_score)
-
-        # 2. 将路径转为边列表用于绘图
-        path_edges = [(best_path[i], best_path[i + 1]) for i in range(len(best_path) - 1)]
-
-        # 提取路径节点（仅保留在路径上的节点）
-        path_nodes = {idx: node_[idx] for idx in best_path}
-        # 转换为 DataFrame
-        df = pd.DataFrame([
-            {"node_id": nid, "x": coord[0], "y": coord[1]} 
-            for nid, coord in path_nodes.items()
-        ])
-
-        # 保存到 Excel
-        excel_path = "path_nodes.xlsx"
-        df.to_excel(excel_path, index=False)
-
-        print(f"路径节点已保存到 {excel_path}")
-        
-
-        # 3. 可视化景观与路径
-        plot_landscape(
-            collection=landscape,
-            nodes=path_nodes,
-            edges=path_edges,  # 只绘制路径边
-            edge_path=edge_paths_,
-            plant_paths=road_path,
-            start_=start_id, end_=end_id,
-            figsize=(12, 12)
-        )
-        plt.show()

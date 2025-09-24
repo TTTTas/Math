@@ -4,6 +4,7 @@ from collections import defaultdict
 import os
 
 import pandas as pd
+from shapely.geometry import Point, Polygon
 
 mm2m_convr = 1000.0;
 
@@ -231,3 +232,37 @@ def load_graph_from_excel(file_path, offset=(0, 0)):
         edge_lengths[(start, end)] = length
 
     return nodes, edges, edge_lengths, edge_paths
+
+def read_boundary_from_dxf(dxf_path):
+    """
+    读取 DXF 文件中的边界多段线，返回 shapely Polygon 对象
+    参数:
+        dxf_path: DXF 文件路径
+    返回:
+        Polygon: 景区边界
+    """
+    doc = ezdxf.readfile(dxf_path)
+    msp = doc.modelspace()
+
+    boundary_points = []
+
+    # 遍历多段线
+    for e in msp.query('LWPOLYLINE POLYLINE'):
+        if e.dxftype() == 'LWPOLYLINE':
+            points = [(point[0] / mm2m_convr, point[1] / mm2m_convr) for point in e.get_points()]
+            # 如果多段线闭合
+            if e.closed:
+                boundary_points.append(points)
+        elif e.dxftype() == 'POLYLINE':
+            pts = [(v.dxf.location.x / mm2m_convr, v.dxf.location.y / mm2m_convr) for v in e.vertices()]
+            if e.is_closed:
+                boundary_points.append(pts)
+
+    if not boundary_points:
+        raise ValueError("DXF 文件中未找到闭合多段线")
+
+    # 如果有多个闭合边界，仅取第一个
+    poly = Polygon(boundary_points[0])
+    if not poly.is_valid:
+        poly = poly.buffer(0)  # 修复可能的自交
+    return poly
